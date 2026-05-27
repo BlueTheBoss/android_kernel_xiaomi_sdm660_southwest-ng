@@ -1,0 +1,110 @@
+name: Build SouthWest-NG Kernel for Tulip
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build (e.g. main-clo for non-dynamic, main-clo-dynamic for dynamic)'
+        required: true
+        default: 'main-clo'
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          repository: BlueTheBoss/android_kernel_xiaomi_sdm660_southwest-ng
+          ref: ${{ github.event.inputs.branch }}
+          path: kernel
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev git zip unzip curl libncurses-dev libncurses6 libtinfo6 python3 rsync libdeflate-dev lz4 liblz4-tool ccache
+
+      - name: Set up Compatibility Symlinks
+        run: |
+          sudo ln -sf /lib/x86_64-linux-gnu/libncurses.so.6 /lib/x86_64-linux-gnu/libncurses.so.5
+          sudo ln -sf /lib/x86_64-linux-gnu/libtinfo.so.6 /lib/x86_64-linux-gnu/libtinfo.so.5
+
+      - name: Download Toolchain (Proton Clang)
+        run: |
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang.git toolchain
+          # Remove obsolete prebuilt LLVM linker to fallback to system linker (prevents glibc RELR relocation crashes)
+          if [ -f "toolchain/bin/ld" ]; then
+            rm -f toolchain/bin/ld
+          fi
+
+      - name: Adapt Kernel Source for Tulip
+        run: |
+          cd kernel
+          # 1. Merge defconfig configurations
+          cat arch/arm64/configs/vendor/xiaomi/sdm660_defconfig arch/arm64/configs/vendor/xiaomi/tulip.config > arch/arm64/configs/vendor/xiaomi/tulip_defconfig
+          
+          # 2. Fix out-of-tree camera include paths and directory mappings
+          find drivers/media/platform/msm/camera_v2-legacy -name "Makefile" -type f -exec sed -i 's/-Idrivers\//-I$(srctree)\/drivers\//g' {} +
+          find drivers/media/platform/msm/camera_v2-legacy -name "Makefile" -type f -exec sed -i 's/camera_v2\([^\-]\)/camera_v2-legacy\1/g' {} +
+          find drivers/media/platform/msm/camera_v2-legacy -name "Makefile" -type f -exec sed -i 's/camera_v2$/camera_v2-legacy/g' {} +
+          
+          # 3. Patch VM fault handler for Clang Werror compatibility
+          sed -i 's/static int isp_vma_fault(/static vm_fault_t isp_vma_fault(/g' drivers/media/platform/msm/camera_v2-legacy/isp/msm_isp.c
+          
+          # 4. Mock min-tool-version check
+          echo -e '#!/bin/sh\necho 2.30.0' > scripts/min-tool-version.sh
+          chmod +x scripts/min-tool-version.sh
+          echo "Adaptations applied successfully!"
+
+      - name: Compile Kernel
+        run: |
+          export PATH="${{ github.workspace }}/toolchain/bin:$PATH"
+          cd kernel
+          # Configure
+          make O=out ARCH=arm64 \
+            CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            vendor/xiaomi/tulip_defconfig
+          
+          # Compile
+          make -j$(nproc) O=out ARCH=arm64 \
+            CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip
+
+      - name: Package Kernel (AnyKernel3 for Tulip)
+        run: |
+          # Clone tedomi2705's AnyKernel3 (beryllium branch)
+          git clone --depth=1 -b beryllium https://github.com/tedomi2705/AnyKernel3.git AnyKernel3
+          
+          # Copy compiled kernel image
+          cp kernel/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+          
+          cd AnyKernel3
+          # Re-route all codename assertions from beryllium -> tulip
+          find . -type f -exec sed -i 's/beryllium/tulip/g' {} +
+          find . -type f -exec sed -i 's/Beryllium/Tulip/g' {} +
+          
+          # Map the correct block device partition for booting
+          sed -i 's/block=.*/block=\/dev\/block\/bootdevice\/by-name\/boot/g' anykernel.sh
+          
+          # Zip package
+          zip -r9 ../SouthWest-NG-tulip-kernel.zip * -x .git README.md
+
+      - name: Upload Flashable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: SouthWest-NG-${{ github.event.inputs.branch }}-tulip-kernel
+          path: SouthWest-NG-tulip-kernel.zip
